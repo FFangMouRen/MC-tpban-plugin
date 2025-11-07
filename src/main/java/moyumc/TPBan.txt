@@ -1,0 +1,657 @@
+package moyumc;
+
+import org.bukkit.*;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitRunnable;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
+
+public class TPBan extends JavaPlugin implements Listener, TabCompleter {
+
+    private FileConfiguration config;
+    private File configFile;
+    private Map<UUID, BanData> bannedPlayers = new HashMap<>();
+    private Map<UUID, Integer> taskIds = new HashMap<>();
+
+    @Override
+    public void onEnable() {
+        // 创建插件数据文件夹
+        if (!getDataFolder().exists()) {
+            getDataFolder().mkdirs();
+        }
+
+        // 加载或创建配置文件
+        configFile = new File(getDataFolder(), "config.yml");
+        if (!configFile.exists()) {
+            try {
+                configFile.createNewFile();
+                config = YamlConfiguration.loadConfiguration(configFile);
+                // 设置默认值
+                config.set("maxXOffset", 10);
+                config.set("maxYOffset", 10);
+                config.set("maxZOffset", 10);
+                // 设置默认封禁位置为世界出生点
+                World world = Bukkit.getWorlds().get(0);
+                Location spawn = world.getSpawnLocation();
+                config.set("banLocation.x", spawn.getX());
+                config.set("banLocation.y", spawn.getY());
+                config.set("banLocation.z", spawn.getZ());
+                config.set("banLocation.world", world.getName());
+                config.save(configFile);
+            } catch (IOException e) {
+                getLogger().severe("无法创建配置文件！");
+                e.printStackTrace();
+            }
+        } else {
+            config = YamlConfiguration.loadConfiguration(configFile);
+        }
+
+        // 加载被封禁玩家数据
+        loadBannedPlayers();
+
+        // 注册事件监听器
+        getServer().getPluginManager().registerEvents(this, this);
+
+        // 启动封禁检查任务
+        startBanChecks();
+    }
+
+    @Override
+    public void onDisable() {
+        // 保存被封禁玩家数据
+        saveBannedPlayers();
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command cmd, String alias, String[] args) {
+        List<String> completions = new ArrayList<>();
+
+        if (cmd.getName().equalsIgnoreCase("tpban")) {
+            if (args.length == 1) {
+                // 玩家名称自动补全
+                for (Player player : Bukkit.getOnlinePlayers()) {
+                    if (player.getName().toLowerCase().startsWith(args[0].toLowerCase())) {
+                        completions.add(player.getName());
+                    }
+                }
+                // 添加clear选项
+                if ("clear".startsWith(args[0].toLowerCase())) {
+                    completions.add("clear");
+                }
+            } else if (args.length == 2 && !args[0].equalsIgnoreCase("clear")) {
+                // 时间格式自动补全
+                completions.add("10分钟");
+                completions.add("30分钟");
+                completions.add("1小时");
+                completions.add("2小时");
+                completions.add("1天");
+            } else if (args.length >= 3 && !args[0].equalsIgnoreCase("clear")) {
+                // 封禁原因自动补全
+                completions.add("作弊");
+                completions.add("不当行为");
+                completions.add("辱骂");
+                completions.add("破坏");
+                completions.add("其他违规");
+            }
+        }
+
+        return completions;
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+        if (cmd.getName().equalsIgnoreCase("tpban")) {
+            if (args.length == 0) {
+                sender.sendMessage(ChatColor.RED + "用法: /tpban <玩家|clear> [时间] [原因]");
+                return true;
+            }
+
+            if (args[0].equalsIgnoreCase("clear")) {
+                if (!sender.hasPermission("tpban.admin")) {
+                    sender.sendMessage(ChatColor.RED + "你没有权限使用此命令！");
+                    return true;
+                }
+
+                if (args.length < 2) {
+                    sender.sendMessage(ChatColor.RED + "用法: /tpban clear <玩家>");
+                    return true;
+                }
+
+                Player target = Bukkit.getPlayer(args[1]);
+                if (target == null) {
+                    sender.sendMessage(ChatColor.RED + "玩家未找到！");
+                    return true;
+                }
+
+                if (bannedPlayers.containsKey(target.getUniqueId())) {
+                    BanData data = bannedPlayers.get(target.getUniqueId());
+                    // 传送玩家回原始位置
+                    target.teleport(data.getOriginalLocation());
+                    // 取消所有任务
+                    cancelPlayerTasks(target);
+                    // 从封禁列表中移除
+                    bannedPlayers.remove(target.getUniqueId());
+                    saveBannedPlayers();
+
+                    target.sendTitle(ChatColor.GREEN + "封禁已解除", "", 10, 70, 20);
+                    target.sendMessage(ChatColor.GREEN + "你的封禁已被解除！");
+                    sender.sendMessage(ChatColor.GREEN + "已解除玩家 " + target.getName() + " 的封禁状态！");
+                } else {
+                    sender.sendMessage(ChatColor.RED + "该玩家未被封禁！");
+                }
+                return true;
+            }
+
+            if (!sender.hasPermission("tpban.command")) {
+                sender.sendMessage(ChatColor.RED + "你没有权限使用此命令！");
+                return true;
+            }
+
+            if (args.length < 3) {
+                sender.sendMessage(ChatColor.RED + "用法: /tpban <玩家> <时间> <原因>");
+                return true;
+            }
+
+            Player target = Bukkit.getPlayer(args[0]);
+            if (target == null) {
+                sender.sendMessage(ChatColor.RED + "玩家未找到！");
+                return true;
+            }
+
+            long time;
+            try {
+                time = parseTime(args[1]);
+            } catch (NumberFormatException e) {
+                sender.sendMessage(ChatColor.RED + "无效的时间格式！使用类似 1小时30分钟, 30分钟, 2小时 等格式。");
+                return true;
+            }
+
+            String reason = String.join(" ", Arrays.copyOfRange(args, 2, args.length));
+
+            banPlayer(target, time, reason);
+            sender.sendMessage(ChatColor.RED + "玩家 " + target.getName() + " 已被TP封禁 " + args[1] + " 原因: " + reason);
+            return true;
+        } else if (cmd.getName().equalsIgnoreCase("tpban_setxyz")) {
+            if (!(sender instanceof Player)) {
+                sender.sendMessage(ChatColor.RED + "只有玩家可以使用此命令！");
+                return true;
+            }
+
+            if (!sender.hasPermission("tpban.admin")) {
+                sender.sendMessage(ChatColor.RED + "你没有权限使用此命令！");
+                return true;
+            }
+
+            Player player = (Player) sender;
+            Location loc = player.getLocation();
+
+            config.set("banLocation.x", loc.getX());
+            config.set("banLocation.y", loc.getY());
+            config.set("banLocation.z", loc.getZ());
+            config.set("banLocation.world", loc.getWorld().getName());
+
+            try {
+                config.save(configFile);
+                sender.sendMessage(ChatColor.GREEN + "TP封禁位置已设置为当前位置！");
+            } catch (IOException e) {
+                sender.sendMessage(ChatColor.RED + "保存封禁位置失败！");
+                e.printStackTrace();
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private long parseTime(String timeStr) throws NumberFormatException {
+        long total = 0;
+        String numStr = "";
+
+        for (char c : timeStr.toCharArray()) {
+            if (Character.isDigit(c)) {
+                numStr += c;
+            } else {
+                if (numStr.isEmpty()) continue;
+
+                long num = Long.parseLong(numStr);
+                numStr = "";
+
+                switch (c) {
+                    case '秒': total += num; break;
+                    case '分': total += num * 60; break;
+                    case '小': total += num * 3600; break;
+                    case '时': total += num * 3600; break;
+                    case '天': total += num * 86400; break;
+                    default: throw new NumberFormatException();
+                }
+            }
+        }
+
+        return total * 1000; // 转换为毫秒
+    }
+
+    private void banPlayer(Player player, long duration, String reason) {
+        Location originalLoc = player.getLocation();
+        Location banLoc = getBanLocation();
+
+        BanData data = new BanData(
+                System.currentTimeMillis(),
+                System.currentTimeMillis() + duration,
+                originalLoc,
+                reason
+        );
+
+        bannedPlayers.put(player.getUniqueId(), data);
+        saveBannedPlayers();
+
+        // 传送玩家到封禁位置
+        player.teleport(banLoc);
+
+        // 为此玩家启动封禁任务
+        startPlayerBanTasks(player);
+    }
+
+    private Location getBanLocation() {
+        // 确保配置中有封禁位置
+        if (!config.contains("banLocation.world")) {
+            // 如果没有设置封禁位置，使用世界出生点
+            World world = Bukkit.getWorlds().get(0);
+            Location spawn = world.getSpawnLocation();
+
+            config.set("banLocation.x", spawn.getX());
+            config.set("banLocation.y", spawn.getY());
+            config.set("banLocation.z", spawn.getZ());
+            config.set("banLocation.world", world.getName());
+
+            try {
+                config.save(configFile);
+            } catch (IOException e) {
+                getLogger().warning("无法保存默认封禁位置！");
+            }
+
+            return spawn;
+        }
+
+        double x = config.getDouble("banLocation.x");
+        double y = config.getDouble("banLocation.y");
+        double z = config.getDouble("banLocation.z");
+        String worldName = config.getString("banLocation.world");
+
+        // 确保世界存在
+        World world = Bukkit.getWorld(worldName);
+        if (world == null) {
+            world = Bukkit.getWorlds().get(0);
+            config.set("banLocation.world", world.getName());
+            try {
+                config.save(configFile);
+            } catch (IOException e) {
+                getLogger().warning("无法更新封禁世界！");
+            }
+        }
+
+        return new Location(world, x, y, z);
+    }
+
+    private void startPlayerBanTasks(Player player) {
+        // 取消现有任务（如果有）
+        cancelPlayerTasks(player);
+
+        // 标题提醒任务
+        int titleTaskId = new BukkitRunnable() {
+            @Override
+            public void run() {
+                if (!bannedPlayers.containsKey(player.getUniqueId())) {
+                    cancel();
+                    return;
+                }
+
+                BanData data = bannedPlayers.get(player.getUniqueId());
+                long remaining = data.getEndTime() - System.currentTimeMillis();
+                String timeStr = formatTime(remaining);
+
+                player.sendTitle(
+                        ChatColor.RED + "你被封禁",
+                        ChatColor.RED + "剩余时间: " + timeStr,
+                        5, 60, 5
+                );
+            }
+        }.runTaskTimer(this, 0, 20).getTaskId();
+
+        // 数学问题任务
+        int mathTaskId = new BukkitRunnable() {
+            @Override
+            public void run() {
+                if (!bannedPlayers.containsKey(player.getUniqueId())) {
+                    cancel();
+                    return;
+                }
+
+                final BanData playerData = bannedPlayers.get(player.getUniqueId());
+                Random random = new Random();
+                int a = random.nextInt(10);
+                int b = random.nextInt(10);
+                final int answer = a + b;
+
+                player.sendMessage(ChatColor.RED + "快速回答: " + a + " + " + b + " = ?");
+                player.sendMessage(ChatColor.RED + "你有5秒时间回答，回答错误或超时将增加5分钟封禁时间！");
+
+                // 取消之前的超时任务（如果有）
+                if (playerData.getTimeoutTask() != null) {
+                    playerData.getTimeoutTask().cancel();
+                }
+
+                // 创建新的超时任务
+                BukkitRunnable timeoutTask = new BukkitRunnable() {
+                    @Override
+                    public void run() {
+                        if (bannedPlayers.containsKey(player.getUniqueId())) {
+                            BanData data = bannedPlayers.get(player.getUniqueId());
+                            data.setEndTime(data.getEndTime() + (5 * 60 * 1000));
+                            player.sendMessage(ChatColor.RED + "回答超时！封禁时间增加5分钟！");
+                            data.setTimeoutTask(null);
+                        }
+                    }
+                };
+                timeoutTask.runTaskLater(TPBan.this, 100L); // 5秒后执行
+
+                // 存储答案和超时任务
+                playerData.setCurrentAnswer(answer);
+                playerData.setTimeoutTask(timeoutTask);
+            }
+        }.runTaskTimer(this, 200, (new Random().nextInt(51) + 10) * 20L).getTaskId();
+
+        // 位置检查任务
+        int positionTaskId = new BukkitRunnable() {
+            @Override
+            public void run() {
+                if (!bannedPlayers.containsKey(player.getUniqueId())) {
+                    cancel();
+                    return;
+                }
+
+                Location banLoc = getBanLocation();
+                Location playerLoc = player.getLocation();
+
+                double xOffset = Math.abs(playerLoc.getX() - banLoc.getX());
+                double yOffset = Math.abs(playerLoc.getY() - banLoc.getY());
+                double zOffset = Math.abs(playerLoc.getZ() - banLoc.getZ());
+
+                double maxX = config.getDouble("maxXOffset", 10);
+                double maxY = config.getDouble("maxYOffset", 10);
+                double maxZ = config.getDouble("maxZOffset", 10);
+
+                if (xOffset > maxX || yOffset > maxY || zOffset > maxZ) {
+                    player.teleport(banLoc);
+                    player.sendMessage(ChatColor.RED + "你试图离开封禁区域！");
+                }
+            }
+        }.runTaskTimer(this, 0, 20).getTaskId();
+
+        // 存储任务ID
+        taskIds.put(player.getUniqueId(), titleTaskId);
+        taskIds.put(player.getUniqueId(), mathTaskId);
+        taskIds.put(player.getUniqueId(), positionTaskId);
+    }
+
+    private void cancelPlayerTasks(Player player) {
+        Integer titleTaskId = taskIds.remove(player.getUniqueId());
+        Integer mathTaskId = taskIds.remove(player.getUniqueId());
+        Integer positionTaskId = taskIds.remove(player.getUniqueId());
+
+        if (titleTaskId != null) Bukkit.getScheduler().cancelTask(titleTaskId);
+        if (mathTaskId != null) Bukkit.getScheduler().cancelTask(mathTaskId);
+        if (positionTaskId != null) Bukkit.getScheduler().cancelTask(positionTaskId);
+    }
+
+    private void startBanChecks() {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                Iterator<Map.Entry<UUID, BanData>> iterator = bannedPlayers.entrySet().iterator();
+                while (iterator.hasNext()) {
+                    Map.Entry<UUID, BanData> entry = iterator.next();
+                    UUID playerId = entry.getKey();
+                    BanData data = entry.getValue();
+
+                    if (System.currentTimeMillis() >= data.getEndTime()) {
+                        // 封禁时间结束
+                        Player player = Bukkit.getPlayer(playerId);
+                        if (player != null) {
+                            player.teleport(data.getOriginalLocation());
+                            player.sendTitle(ChatColor.GREEN + "封禁结束", "", 10, 70, 20);
+                            player.sendMessage(ChatColor.GREEN + "你的封禁已结束！");
+                            cancelPlayerTasks(player);
+                        }
+                        iterator.remove();
+                    }
+                }
+                saveBannedPlayers();
+            }
+        }.runTaskTimer(this, 0, 20);
+    }
+
+    @EventHandler
+    public void onPlayerInteract(PlayerInteractEvent event) {
+        Player player = event.getPlayer();
+        if (bannedPlayers.containsKey(player.getUniqueId())) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
+        if (bannedPlayers.containsKey(player.getUniqueId())) {
+            BanData data = bannedPlayers.get(player.getUniqueId());
+
+            // 检查封禁时间是否结束
+            if (System.currentTimeMillis() >= data.getEndTime()) {
+                bannedPlayers.remove(player.getUniqueId());
+                saveBannedPlayers();
+                return;
+            }
+
+            // 传送到封禁位置
+            player.teleport(getBanLocation());
+
+            // 重启封禁任务
+            startPlayerBanTasks(player);
+
+            player.sendMessage(ChatColor.RED + "你的封禁仍在继续，剩余时间: " +
+                    formatTime(data.getEndTime() - System.currentTimeMillis()));
+        }
+    }
+
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        Player player = event.getPlayer();
+        if (bannedPlayers.containsKey(player.getUniqueId())) {
+            cancelPlayerTasks(player);
+        }
+    }
+
+    @EventHandler
+    public void onPlayerRespawn(PlayerRespawnEvent event) {
+        Player player = event.getPlayer();
+        if (bannedPlayers.containsKey(player.getUniqueId())) {
+            event.setRespawnLocation(getBanLocation());
+        }
+    }
+
+    @EventHandler
+    public void onPlayerChat(AsyncPlayerChatEvent event) {
+        Player player = event.getPlayer();
+        if (bannedPlayers.containsKey(player.getUniqueId())) {
+            BanData data = bannedPlayers.get(player.getUniqueId());
+
+            try {
+                int answer = Integer.parseInt(event.getMessage().trim());
+                if (data.getCurrentAnswer() == answer) {
+                    // 回答正确，取消超时任务
+                    if (data.getTimeoutTask() != null) {
+                        data.getTimeoutTask().cancel();
+                        data.setTimeoutTask(null);
+                    }
+                    player.sendMessage(ChatColor.GREEN + "回答正确！");
+                    event.setCancelled(true);
+                } else {
+                    // 回答错误，增加时间
+                    data.setEndTime(data.getEndTime() + (5 * 60 * 1000));
+                    player.sendMessage(ChatColor.RED + "回答错误！封禁时间增加5分钟！");
+                    event.setCancelled(true);
+
+                    // 取消超时任务，因为已经处理了
+                    if (data.getTimeoutTask() != null) {
+                        data.getTimeoutTask().cancel();
+                        data.setTimeoutTask(null);
+                    }
+                }
+            } catch (NumberFormatException e) {
+                // 不是数字，忽略
+            }
+        }
+    }
+
+    private String formatTime(long millis) {
+        long seconds = millis / 1000;
+        long minutes = seconds / 60;
+        long hours = minutes / 60;
+        long days = hours / 24;
+
+        seconds %= 60;
+        minutes %= 60;
+        hours %= 24;
+
+        StringBuilder sb = new StringBuilder();
+        if (days > 0) sb.append(days).append("天 ");
+        if (hours > 0) sb.append(hours).append("小时 ");
+        if (minutes > 0) sb.append(minutes).append("分钟 ");
+        sb.append(seconds).append("秒");
+
+        return sb.toString();
+    }
+
+    private void saveBannedPlayers() {
+        File dataFile = new File(getDataFolder(), "banned_players.yml");
+        FileConfiguration dataConfig = new YamlConfiguration();
+
+        for (Map.Entry<UUID, BanData> entry : bannedPlayers.entrySet()) {
+            String path = "players." + entry.getKey().toString();
+            BanData data = entry.getValue();
+
+            dataConfig.set(path + ".startTime", data.getStartTime());
+            dataConfig.set(path + ".endTime", data.getEndTime());
+            dataConfig.set(path + ".reason", data.getReason());
+
+            // 保存原始位置
+            Location loc = data.getOriginalLocation();
+            dataConfig.set(path + ".originalLocation.x", loc.getX());
+            dataConfig.set(path + ".originalLocation.y", loc.getY());
+            dataConfig.set(path + ".originalLocation.z", loc.getZ());
+            dataConfig.set(path + ".originalLocation.world", loc.getWorld().getName());
+        }
+
+        try {
+            dataConfig.save(dataFile);
+        } catch (IOException e) {
+            getLogger().warning("保存封禁玩家数据失败！");
+            e.printStackTrace();
+        }
+    }
+
+    private void loadBannedPlayers() {
+        File dataFile = new File(getDataFolder(), "banned_players.yml");
+        if (!dataFile.exists()) return;
+
+        FileConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+        if (!dataConfig.contains("players")) return;
+
+        for (String key : dataConfig.getConfigurationSection("players").getKeys(false)) {
+            UUID uuid = UUID.fromString(key);
+            String path = "players." + key;
+
+            long startTime = dataConfig.getLong(path + ".startTime");
+            long endTime = dataConfig.getLong(path + ".endTime");
+            String reason = dataConfig.getString(path + ".reason");
+
+            // 加载原始位置
+            double x = dataConfig.getDouble(path + ".originalLocation.x");
+            double y = dataConfig.getDouble(path + ".originalLocation.y");
+            double z = dataConfig.getDouble(path + ".originalLocation.z");
+            String worldName = dataConfig.getString(path + ".originalLocation.world");
+            World world = Bukkit.getWorld(worldName);
+            if (world == null) world = Bukkit.getWorlds().get(0);
+
+            Location originalLoc = new Location(world, x, y, z);
+
+            BanData data = new BanData(startTime, endTime, originalLoc, reason);
+            bannedPlayers.put(uuid, data);
+        }
+    }
+
+    private static class BanData {
+        private long startTime;
+        private long endTime;
+        private Location originalLocation;
+        private String reason;
+        private int currentAnswer;
+        private BukkitRunnable timeoutTask;
+
+        public BanData(long startTime, long endTime, Location originalLocation, String reason) {
+            this.startTime = startTime;
+            this.endTime = endTime;
+            this.originalLocation = originalLocation;
+            this.reason = reason;
+        }
+
+        public long getStartTime() {
+            return startTime;
+        }
+
+        public long getEndTime() {
+            return endTime;
+        }
+
+        public void setEndTime(long endTime) {
+            this.endTime = endTime;
+        }
+
+        public Location getOriginalLocation() {
+            return originalLocation;
+        }
+
+        public String getReason() {
+            return reason;
+        }
+
+        public int getCurrentAnswer() {
+            return currentAnswer;
+        }
+
+        public void setCurrentAnswer(int currentAnswer) {
+            this.currentAnswer = currentAnswer;
+        }
+
+        public BukkitRunnable getTimeoutTask() {
+            return timeoutTask;
+        }
+
+        public void setTimeoutTask(BukkitRunnable timeoutTask) {
+            this.timeoutTask = timeoutTask;
+        }
+    }
+}
